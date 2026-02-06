@@ -56,12 +56,18 @@ ONENOTE_DIR = Path(
 # Logging (to stderr so it doesn't break stdio MCP transport)
 # ---------------------------------------------------------------------------
 
+LOG_FILE = os.path.join(tempfile.gettempdir(), "onenote_mcp.log")
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    stream=sys.stderr,
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
 log = logging.getLogger("onenote-mcp")
+log.info("Log file: %s", LOG_FILE)
 
 # ---------------------------------------------------------------------------
 # OneNote file parsing helpers
@@ -501,17 +507,24 @@ def _run_powershell_file(script: str) -> tuple[bool, str]:
     try:
         with open(ps_file, "w", encoding="utf-8") as f:
             f.write(script)
+        log.debug("Running PowerShell script (%d chars): %s", len(script), ps_file)
         result = subprocess.run(
             ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File", ps_file],
             capture_output=True, text=True, timeout=30,
         )
         output = result.stdout.strip()
+        stderr = result.stderr.strip()
+        log.debug("PowerShell exit=%d stdout=%s stderr=%s",
+                  result.returncode, output[:500] if output else "(empty)",
+                  stderr[:500] if stderr else "(empty)")
         if result.returncode != 0:
-            return False, result.stderr.strip() or output
+            return False, stderr or output
         return True, output
     except subprocess.TimeoutExpired:
+        log.error("PowerShell timed out")
         return False, "PowerShell command timed out"
     except FileNotFoundError:
+        log.error("PowerShell not found")
         return False, "PowerShell not found (write features require Windows)"
     finally:
         try:
@@ -522,8 +535,11 @@ def _run_powershell_file(script: str) -> tuple[bool, str]:
 
 def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool, str]:
     """Create a new page in a section using the OneNote COM API."""
+    log.info("create_page: title=%r, body_len=%d, section=%s", title, len(body_html), section_id)
+    log.debug("create_page: raw body=%r", body_html[:500])
     # Sanitize HTML to OneNote-compatible inline format
     body_html = _sanitize_html_for_onenote(body_html)
+    log.debug("create_page: sanitized body=%r", body_html[:500])
     # Escape for PowerShell string literals (double up single quotes)
     section_id_esc = section_id.replace("'", "''")
     title_esc = title.replace("'", "''")
@@ -548,7 +564,12 @@ if ($titleNode) {{
 }}
 
 # Update title
-$onenote.UpdatePageContent($xml.OuterXml)
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Title UpdatePageContent failed: $_"
+    exit 1
+}}
 
 # Re-fetch to add body
 $pageXml2 = ""
@@ -567,10 +588,16 @@ $oeChildren.AppendChild($oe) | Out-Null
 $outline.AppendChild($oeChildren) | Out-Null
 $xml2.DocumentElement.AppendChild($outline) | Out-Null
 
-$onenote.UpdatePageContent($xml2.OuterXml)
+try {{
+    $onenote.UpdatePageContent($xml2.OuterXml)
+}} catch {{
+    Write-Error "Body UpdatePageContent failed: $_"
+    exit 1
+}}
 Write-Output $pageId
 '''
     ok, output = _run_powershell_file(script)
+    log.info("create_page result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
     if ok and output:
         return True, f"Page '{title}' created successfully (ID: {output})"
     return False, f"Failed to create page: {output}"
@@ -578,7 +605,10 @@ Write-Output $pageId
 
 def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
     """Append content to an existing page using the OneNote COM API."""
+    log.info("append_to_page: page=%s, body_len=%d", page_id, len(body_html))
+    log.debug("append_to_page: raw body=%r", body_html[:500])
     body_html = _sanitize_html_for_onenote(body_html)
+    log.debug("append_to_page: sanitized body=%r", body_html[:500])
     page_id_esc = page_id.replace("'", "''")
     body_esc = body_html.replace("'", "''")
 
@@ -599,10 +629,16 @@ $oeChildren.AppendChild($oe) | Out-Null
 $outline.AppendChild($oeChildren) | Out-Null
 $xml.DocumentElement.AppendChild($outline) | Out-Null
 
-$onenote.UpdatePageContent($xml.OuterXml)
+try {{
+    $onenote.UpdatePageContent($xml.OuterXml)
+}} catch {{
+    Write-Error "Append UpdatePageContent failed: $_"
+    exit 1
+}}
 Write-Output "OK"
 '''
     ok, output = _run_powershell_file(script)
+    log.info("append_to_page result: ok=%s output=%r", ok, output[:200] if output else "(empty)")
     if ok:
         return True, "Content appended successfully."
     return False, f"Failed to append content: {output}"
