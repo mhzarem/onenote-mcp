@@ -460,41 +460,80 @@ def _com_find_section_id(notebook_name: str, section_name: str) -> str | None:
     return None
 
 
+def _run_powershell_file(script: str) -> tuple[bool, str]:
+    """Write a PowerShell script to a temp file and execute it."""
+    ps_file = os.path.join(tempfile.gettempdir(), "onenote_mcp_cmd.ps1")
+    try:
+        with open(ps_file, "w", encoding="utf-8") as f:
+            f.write(script)
+        result = subprocess.run(
+            ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File", ps_file],
+            capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            return False, result.stderr.strip() or output
+        return True, output
+    except subprocess.TimeoutExpired:
+        return False, "PowerShell command timed out"
+    except FileNotFoundError:
+        return False, "PowerShell not found (write features require Windows)"
+    finally:
+        try:
+            os.remove(ps_file)
+        except OSError:
+            pass
+
+
 def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool, str]:
     """Create a new page in a section using the OneNote COM API."""
-    # Escape special characters for PowerShell
+    # Escape for PowerShell string literals (double up single quotes)
     section_id_esc = section_id.replace("'", "''")
-    title_esc = title.replace("'", "''").replace('"', '&quot;')
-    body_esc = body_html.replace("'", "''").replace('"', '&quot;')
+    title_esc = title.replace("'", "''")
+    body_esc = body_html.replace("'", "''")
 
-    script = (
-        f"$onenote = New-Object -ComObject OneNote.Application; "
-        f"$pageId = ''; "
-        f"$onenote.CreateNewPage('{section_id_esc}', [ref]$pageId, 0); "
-        f"$pageXml = ''; "
-        f"$onenote.GetPageContent($pageId, [ref]$pageXml, 0); "
-        f"$ns = @{{one='http://schemas.microsoft.com/office/onenote/2013/onenote'}}; "
-        f"$xml = [xml]$pageXml; "
-        f"$titleNode = $xml.SelectSingleNode('//one:Title/one:OE/one:T', "
-        f"  (New-Object System.Xml.XmlNamespaceManager($xml.NameTable)).PSBase); "
-        f"$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable); "
-        f"$nsMgr.AddNamespace('one', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$titleNode2 = $xml.SelectSingleNode('//one:Title/one:OE/one:T', $nsMgr); "
-        f"if ($titleNode2) {{ $titleNode2.InnerText = '{title_esc}' }}; "
-        f"$outline = $xml.CreateElement('one', 'Outline', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$oe = $xml.CreateElement('one', 'OEChildren', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$oe1 = $xml.CreateElement('one', 'OE', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$t = $xml.CreateElement('one', 'T', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$cdata = $xml.CreateCDataSection('{body_esc}'); "
-        f"$t.AppendChild($cdata) | Out-Null; "
-        f"$oe1.AppendChild($t) | Out-Null; "
-        f"$oe.AppendChild($oe1) | Out-Null; "
-        f"$outline.AppendChild($oe) | Out-Null; "
-        f"$xml.DocumentElement.AppendChild($outline) | Out-Null; "
-        f"$onenote.UpdatePageContent($xml.OuterXml, [DateTime]::MinValue, 0); "
-        f"Write-Output $pageId"
-    )
-    ok, output = _run_powershell(script)
+    script = f'''
+$onenote = New-Object -ComObject OneNote.Application
+$pageId = ""
+$onenote.CreateNewPage('{section_id_esc}', [ref]$pageId, 0)
+
+# Get the new page's XML
+$pageXml = ""
+$onenote.GetPageContent($pageId, [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+
+# Set title
+$nsMgr = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+$nsMgr.AddNamespace("one", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$titleNode = $xml.SelectSingleNode("//one:Title/one:OE/one:T", $nsMgr)
+if ($titleNode) {{
+    $titleNode.InnerXml = "<![CDATA[{title_esc}]]>"
+}}
+
+# Update title
+$onenote.UpdatePageContent($xml.OuterXml)
+
+# Re-fetch to add body
+$pageXml2 = ""
+$onenote.GetPageContent($pageId, [ref]$pageXml2, 0)
+$xml2 = [xml]$pageXml2
+
+# Add body outline
+$outline = $xml2.CreateElement("one", "Outline", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oeChildren = $xml2.CreateElement("one", "OEChildren", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oe = $xml2.CreateElement("one", "OE", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$t = $xml2.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$cdata = $xml2.CreateCDataSection('{body_esc}')
+$t.AppendChild($cdata) | Out-Null
+$oe.AppendChild($t) | Out-Null
+$oeChildren.AppendChild($oe) | Out-Null
+$outline.AppendChild($oeChildren) | Out-Null
+$xml2.DocumentElement.AppendChild($outline) | Out-Null
+
+$onenote.UpdatePageContent($xml2.OuterXml)
+Write-Output $pageId
+'''
+    ok, output = _run_powershell_file(script)
     if ok and output:
         return True, f"Page '{title}' created successfully (ID: {output})"
     return False, f"Failed to create page: {output}"
@@ -503,27 +542,29 @@ def _com_create_page(section_id: str, title: str, body_html: str) -> tuple[bool,
 def _com_append_to_page(page_id: str, body_html: str) -> tuple[bool, str]:
     """Append content to an existing page using the OneNote COM API."""
     page_id_esc = page_id.replace("'", "''")
-    body_esc = body_html.replace("'", "''").replace('"', '&quot;')
+    body_esc = body_html.replace("'", "''")
 
-    script = (
-        f"$onenote = New-Object -ComObject OneNote.Application; "
-        f"$pageXml = ''; "
-        f"$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0); "
-        f"$xml = [xml]$pageXml; "
-        f"$outline = $xml.CreateElement('one', 'Outline', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$oe = $xml.CreateElement('one', 'OEChildren', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$oe1 = $xml.CreateElement('one', 'OE', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$t = $xml.CreateElement('one', 'T', 'http://schemas.microsoft.com/office/onenote/2013/onenote'); "
-        f"$cdata = $xml.CreateCDataSection('{body_esc}'); "
-        f"$t.AppendChild($cdata) | Out-Null; "
-        f"$oe1.AppendChild($t) | Out-Null; "
-        f"$oe.AppendChild($oe1) | Out-Null; "
-        f"$outline.AppendChild($oe) | Out-Null; "
-        f"$xml.DocumentElement.AppendChild($outline) | Out-Null; "
-        f"$onenote.UpdatePageContent($xml.OuterXml, [DateTime]::MinValue, 0); "
-        f"Write-Output 'OK'"
-    )
-    ok, output = _run_powershell(script)
+    script = f'''
+$onenote = New-Object -ComObject OneNote.Application
+$pageXml = ""
+$onenote.GetPageContent('{page_id_esc}', [ref]$pageXml, 0)
+$xml = [xml]$pageXml
+
+$outline = $xml.CreateElement("one", "Outline", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oeChildren = $xml.CreateElement("one", "OEChildren", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$oe = $xml.CreateElement("one", "OE", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$t = $xml.CreateElement("one", "T", "http://schemas.microsoft.com/office/onenote/2013/onenote")
+$cdata = $xml.CreateCDataSection('{body_esc}')
+$t.AppendChild($cdata) | Out-Null
+$oe.AppendChild($t) | Out-Null
+$oeChildren.AppendChild($oe) | Out-Null
+$outline.AppendChild($oeChildren) | Out-Null
+$xml.DocumentElement.AppendChild($outline) | Out-Null
+
+$onenote.UpdatePageContent($xml.OuterXml)
+Write-Output "OK"
+'''
+    ok, output = _run_powershell_file(script)
     if ok:
         return True, "Content appended successfully."
     return False, f"Failed to append content: {output}"
